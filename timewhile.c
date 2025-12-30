@@ -116,11 +116,47 @@ void reAddTimer(Wheel *wheel, TimeWheelNode *node)
 }
 
 // 用于 L2~L5：只 cascade，不执行
-static void cascadeLevel(TimeWheelNode **wheel, int size, int begin, int end, Wheel *w)
+static void cascadeLevel(TimeWheelNode **wheel, int size, int level, uint64_t last, uint64_t now, Wheel *w)
 {
-    if (end >= begin)
+
+    int begin,end,round;
+    switch(level)
     {
-        for (int i = begin + 1; i <= end; ++i)
+        case 5:
+        {
+            begin = (last >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+            end = (now >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+            round = TVR_SIZE * TVN_SIZE * TVN_SIZE * TVN_SIZE * TVN_SIZE;
+            break;
+        }
+        case 4:
+        {
+            begin = (last >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+            end = (now >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+            round = TVR_SIZE * TVN_SIZE * TVN_SIZE * TVN_SIZE;
+            break;
+        }
+        case 3:
+        {
+            begin = (last >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
+            end = (now >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
+            round = TVR_SIZE * TVN_SIZE * TVN_SIZE;
+            break;
+        }
+        case 2:
+        {
+            begin = (last >> TVR_BITS) & TVN_MASK;
+            end = (now >> TVR_BITS) & TVN_MASK;
+            round = TVR_SIZE * TVN_SIZE;
+            break;
+        }
+        default:
+            break;
+    }
+
+    if(now - last >= round)
+    {
+        for (int i = 0; i < size; ++i)
         {
             TimeWheelNode *head = wheel[i];
             wheel[i] = NULL;
@@ -134,37 +170,59 @@ static void cascadeLevel(TimeWheelNode **wheel, int size, int begin, int end, Wh
     }
     else
     {
-        for (int i = begin + 1; i < size; ++i)
+        if (end >= begin)
         {
-            TimeWheelNode *head = wheel[i];
-            wheel[i] = NULL;
-            while (head)
+            for (int i = begin + 1; i <= end; ++i)
             {
-                TimeWheelNode *next = head->next;
-                reAddTimer(w, head);
-                head = next;
+                TimeWheelNode *head = wheel[i];
+                wheel[i] = NULL;
+                while (head)
+                {
+                    TimeWheelNode *next = head->next;
+                    reAddTimer(w, head); // 重新插入时间轮
+                    head = next;
+                }
             }
         }
-        for (int i = 0; i <= end; ++i)
+        else
         {
-            TimeWheelNode *head = wheel[i];
-            wheel[i] = NULL;
-            while (head)
+            for (int i = begin + 1; i < size; ++i)
             {
-                TimeWheelNode *next = head->next;
-                reAddTimer(w, head);
-                head = next;
+                TimeWheelNode *head = wheel[i];
+                wheel[i] = NULL;
+                while (head)
+                {
+                    TimeWheelNode *next = head->next;
+                    reAddTimer(w, head);
+                    head = next;
+                }
+            }
+            for (int i = 0; i <= end; ++i)
+            {
+                TimeWheelNode *head = wheel[i];
+                wheel[i] = NULL;
+                while (head)
+                {
+                    TimeWheelNode *next = head->next;
+                    reAddTimer(w, head);
+                    head = next;
+                }
             }
         }
     }
+
+    
 }
 
 // 用于 L1：执行已到期的
-static void execTimerL1(TimeWheelNode **wheel, int size, int begin, int end, uint64_t now)
+static void execTimerL1(TimeWheelNode **wheel, int size, uint64_t last, uint64_t now)
 {
-    if (end >= begin)
+    int begin = last & TVR_MASK;
+    int end = now & TVR_MASK;
+
+    if (now - last >= size)
     {
-        for (int i = begin + 1; i <= end; ++i)
+        for (int i = 0; i < size; ++i)
         {
             TimeWheelNode **pp = &wheel[i];
             while (*pp)
@@ -186,45 +244,71 @@ static void execTimerL1(TimeWheelNode **wheel, int size, int begin, int end, uin
     }
     else
     {
-        for (int i = begin + 1; i < size; ++i)
+        if (end >= begin)
         {
-            TimeWheelNode **pp = &wheel[i];
-            while (*pp)
+            for (int i = begin + 1; i <= end; ++i)
             {
-                TimeWheelNode *node = *pp;
-                if (node->expire <= now)
+                TimeWheelNode **pp = &wheel[i];
+                while (*pp)
                 {
-                    if (node->active)
-                        node->func(node->args);
-                    *pp = node->next;
-                    free(node);
-                }
-                else
-                {
-                    pp = &node->next;
+                    TimeWheelNode *node = *pp;
+                    if (node->expire <= now)
+                    {
+                        if (node->active)
+                            node->func(node->args);
+                        *pp = node->next;
+                        free(node);
+                    }
+                    else
+                    {
+                        pp = &node->next;
+                    }
                 }
             }
         }
-        for (int i = 0; i <= end; ++i)
+        else
         {
-            TimeWheelNode **pp = &wheel[i];
-            while (*pp)
+            for (int i = begin + 1; i < size; ++i)
             {
-                TimeWheelNode *node = *pp;
-                if (node->expire <= now)
+                TimeWheelNode **pp = &wheel[i];
+                while (*pp)
                 {
-                    if (node->active)
-                        node->func(node->args);
-                    *pp = node->next;
-                    free(node);
+                    TimeWheelNode *node = *pp;
+                    if (node->expire <= now)
+                    {
+                        if (node->active)
+                            node->func(node->args);
+                        *pp = node->next;
+                        free(node);
+                    }
+                    else
+                    {
+                        pp = &node->next;
+                    }
                 }
-                else
+            }
+            for (int i = 0; i <= end; ++i)
+            {
+                TimeWheelNode **pp = &wheel[i];
+                while (*pp)
                 {
-                    pp = &node->next;
+                    TimeWheelNode *node = *pp;
+                    if (node->expire <= now)
+                    {
+                        if (node->active)
+                            node->func(node->args);
+                        *pp = node->next;
+                        free(node);
+                    }
+                    else
+                    {
+                        pp = &node->next;
+                    }
                 }
             }
         }
     }
+    
 }
 
 void expireTimer(Wheel *w)
@@ -233,33 +317,20 @@ void expireTimer(Wheel *w)
     if (current <= w->time)
         return;
 
-    // 总是 cascade 所有层级，无论跳变多大
-    int begin, end;
-
     // L5
-    begin = (w->time >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
-    end = (current >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
-    cascadeLevel(w->wheelL5, TVN_SIZE, begin, end, w);
+    cascadeLevel(w->wheelL5, TVN_SIZE, 5, w->time, current, w);
 
     // L4
-    begin = (w->time >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
-    end = (current >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
-    cascadeLevel(w->wheelL4, TVN_SIZE, begin, end, w);
+    cascadeLevel(w->wheelL4, TVN_SIZE, 4, w->time, current, w);
 
     // L3
-    begin = (w->time >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
-    end = (current >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
-    cascadeLevel(w->wheelL3, TVN_SIZE, begin, end, w);
+    cascadeLevel(w->wheelL3, TVN_SIZE, 3, w->time, current, w);
 
     // L2
-    begin = (w->time >> TVR_BITS) & TVN_MASK;
-    end = (current >> TVR_BITS) & TVN_MASK;
-    cascadeLevel(w->wheelL2, TVN_SIZE, begin, end, w);
+    cascadeLevel(w->wheelL2, TVN_SIZE, 2, w->time, current, w);
 
-    // L1: 现在只需要处理 [w->time, current] 区间
-    int begin_l1 = w->time & TVR_MASK;
-    int end_l1 = current & TVR_MASK;
-    execTimerL1(w->wheelL1, TVR_SIZE, begin_l1, end_l1, current);
+    //L1
+    execTimerL1(w->wheelL1, TVR_SIZE, w->time, current);
 
     w->time = current;
 }
