@@ -1,9 +1,12 @@
+#define _POSIX_C_SOURCE 199309L
+
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <time.h>
 
 // 时间轮层级参数（2 的幂）
 #define TVR_BITS 8 // L1: 2^8 = 256 slots
@@ -15,7 +18,7 @@
 #define TVR_MASK (TVR_SIZE - 1) // 0xFF
 #define TVN_MASK (TVN_SIZE - 1) // 0x3F
 
-// 最大支持延迟：2^(8 + 4*6) = 2^32 = 4294967296，但 uint32_t 最大为 4294967295
+// 最大支持延迟：2^(8 + 4*6) = 2^32 = 4294967296，但 uint64_t 最大为 4294967295
 #define MAX_SUPPORTED_DELAY (UINT32_MAX)
 
 typedef void (*callback)(void *);
@@ -26,7 +29,7 @@ typedef struct TimeWheelNode
     callback func;
     struct TimeWheelNode *next;
     void *args;
-    uint32_t expire;
+    uint64_t expire;
     bool active;
     
 } TimeWheelNode;
@@ -38,12 +41,20 @@ typedef struct Wheel
     TimeWheelNode *wheelL3[TVN_SIZE];
     TimeWheelNode *wheelL4[TVN_SIZE];
     TimeWheelNode *wheelL5[TVN_SIZE];
+    uint64_t time;
 } Wheel;
 
+uint64_t get_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
 
 void initWheel(Wheel *wheel)
 {
     memset(wheel, 0, sizeof(Wheel));
+    wheel->time = get_monotonic_ms();
 }
 
 void insertTimer(TimeWheelNode **slot, TimeWheelNode *node)
@@ -52,7 +63,7 @@ void insertTimer(TimeWheelNode **slot, TimeWheelNode *node)
     *slot = node;
 }
 
-void reAddTimer(Wheel *wheel, TimeWheelNode *node, uint32_t current)
+void reAddTimer(Wheel *wheel, TimeWheelNode *node)
 {
 
     if(node->active == false)
@@ -60,8 +71,9 @@ void reAddTimer(Wheel *wheel, TimeWheelNode *node, uint32_t current)
         free(node);
         return;
     }
-    uint32_t expire = node->expire;
-    uint32_t delay = expire - current;
+    uint64_t current = get_monotonic_ms();
+    uint64_t expire = node->expire;
+    uint64_t delay = expire - current;
 
     int level;
     int pos;
@@ -103,81 +115,156 @@ void reAddTimer(Wheel *wheel, TimeWheelNode *node, uint32_t current)
     }
 }
 
-void expireTimer(Wheel *w, uint32_t current)
+// 用于 L2~L5：只 cascade，不执行
+static void cascadeLevel(TimeWheelNode **wheel, int size, int begin, int end, Wheel *w)
 {
-    uint32_t pos0 = current & TVR_MASK;
-    uint32_t pos1 = (current >> TVR_BITS) & TVN_MASK;
-    uint32_t pos2 = (current >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
-    uint32_t pos3 = (current >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
-    uint32_t pos4 = (current >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
-
-    // Cascade: only when lower wheel wraps around
-    if (pos0 == 0)
+    if (end >= begin)
     {
-        // Promote L2[pos1] → L1
-        TimeWheelNode *head = w->wheelL2[pos1];
-        w->wheelL2[pos1] = NULL;
-        while (head)
+        for (int i = begin + 1; i <= end; ++i)
         {
-            TimeWheelNode *next = head->next;
-            reAddTimer(w, head, current);
-            head = next;
-        }
-
-        if (pos1 == 0)
-        {
-            // Promote L3[pos2] → lower levels
-            head = w->wheelL3[pos2];
-            w->wheelL3[pos2] = NULL;
+            TimeWheelNode *head = wheel[i];
+            wheel[i] = NULL;
             while (head)
             {
                 TimeWheelNode *next = head->next;
-                reAddTimer(w, head, current);
+                reAddTimer(w, head); // 重新插入时间轮
                 head = next;
             }
-
-            if (pos2 == 0)
+        }
+    }
+    else
+    {
+        for (int i = begin + 1; i < size; ++i)
+        {
+            TimeWheelNode *head = wheel[i];
+            wheel[i] = NULL;
+            while (head)
             {
-                head = w->wheelL4[pos3];
-                w->wheelL4[pos3] = NULL;
-                while (head)
-                {
-                    TimeWheelNode *next = head->next;
-                    reAddTimer(w, head, current);
-                    head = next;
-                }
+                TimeWheelNode *next = head->next;
+                reAddTimer(w, head);
+                head = next;
+            }
+        }
+        for (int i = 0; i <= end; ++i)
+        {
+            TimeWheelNode *head = wheel[i];
+            wheel[i] = NULL;
+            while (head)
+            {
+                TimeWheelNode *next = head->next;
+                reAddTimer(w, head);
+                head = next;
+            }
+        }
+    }
+}
 
-                if (pos3 == 0)
+// 用于 L1：执行已到期的
+static void execTimerL1(TimeWheelNode **wheel, int size, int begin, int end, uint64_t now)
+{
+    if (end >= begin)
+    {
+        for (int i = begin + 1; i <= end; ++i)
+        {
+            TimeWheelNode **pp = &wheel[i];
+            while (*pp)
+            {
+                TimeWheelNode *node = *pp;
+                if (node->expire <= now)
                 {
-                    head = w->wheelL5[pos4];
-                    w->wheelL5[pos4] = NULL;
-                    while (head)
-                    {
-                        TimeWheelNode *next = head->next;
-                        reAddTimer(w, head, current);
-                        head = next;
-                    }
+                    if (node->active)
+                        node->func(node->args);
+                    *pp = node->next;
+                    free(node);
+                }
+                else
+                {
+                    pp = &node->next;
                 }
             }
         }
     }
-
-    // Execute all timers in L1[current % TVR_SIZE]
-    
-    TimeWheelNode *head = w->wheelL1[pos0];
-    w->wheelL1[pos0] = NULL;
-    while (head)
+    else
     {
-        TimeWheelNode *next = head->next;
-        if (head->active == true)
-            head->func(head->args);
-        free(head);
-        head = next;
+        for (int i = begin + 1; i < size; ++i)
+        {
+            TimeWheelNode **pp = &wheel[i];
+            while (*pp)
+            {
+                TimeWheelNode *node = *pp;
+                if (node->expire <= now)
+                {
+                    if (node->active)
+                        node->func(node->args);
+                    *pp = node->next;
+                    free(node);
+                }
+                else
+                {
+                    pp = &node->next;
+                }
+            }
+        }
+        for (int i = 0; i <= end; ++i)
+        {
+            TimeWheelNode **pp = &wheel[i];
+            while (*pp)
+            {
+                TimeWheelNode *node = *pp;
+                if (node->expire <= now)
+                {
+                    if (node->active)
+                        node->func(node->args);
+                    *pp = node->next;
+                    free(node);
+                }
+                else
+                {
+                    pp = &node->next;
+                }
+            }
+        }
     }
-
 }
 
-TimeWheelNode* addNewTimer(Wheel *wheel, callback func, uint32_t delay, void *args, uint32_t current)
+void expireTimer(Wheel *w)
+{
+    uint64_t current = get_monotonic_ms();
+    if (current <= w->time)
+        return;
+
+    // 总是 cascade 所有层级，无论跳变多大
+    int begin, end;
+
+    // L5
+    begin = (w->time >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+    end = (current >> (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+    cascadeLevel(w->wheelL5, TVN_SIZE, begin, end, w);
+
+    // L4
+    begin = (w->time >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+    end = (current >> (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+    cascadeLevel(w->wheelL4, TVN_SIZE, begin, end, w);
+
+    // L3
+    begin = (w->time >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
+    end = (current >> (TVR_BITS + TVN_BITS)) & TVN_MASK;
+    cascadeLevel(w->wheelL3, TVN_SIZE, begin, end, w);
+
+    // L2
+    begin = (w->time >> TVR_BITS) & TVN_MASK;
+    end = (current >> TVR_BITS) & TVN_MASK;
+    cascadeLevel(w->wheelL2, TVN_SIZE, begin, end, w);
+
+    // L1: 现在只需要处理 [w->time, current] 区间
+    int begin_l1 = w->time & TVR_MASK;
+    int end_l1 = current & TVR_MASK;
+    execTimerL1(w->wheelL1, TVR_SIZE, begin_l1, end_l1, current);
+
+    w->time = current;
+}
+
+TimeWheelNode* addNewTimer(Wheel *wheel, callback func, uint64_t delay, void *args)
 {
     if (delay == 0)
     {
@@ -185,8 +272,9 @@ TimeWheelNode* addNewTimer(Wheel *wheel, callback func, uint32_t delay, void *ar
         return NULL;
     }
 
+    uint64_t current = get_monotonic_ms();
     // 防止溢出：current + delay 可能回绕，但 expire 仍有效（只要 delay <= MAX）
-    uint32_t expire = current + delay; // unsigned arithmetic is well-defined
+    uint64_t expire = current + delay; // unsigned arithmetic is well-defined
 
     TimeWheelNode *node = malloc(sizeof(TimeWheelNode));
     if (!node)
@@ -267,7 +355,8 @@ void clearTimeWheel(Wheel *w)
 
 void cancelTimer(TimeWheelNode* t)
 {
-    t->active = false;
+    if(t&&t->active==true)
+        t->active = false;
 }
 
 void on_timer(void *arg)
@@ -279,11 +368,10 @@ void on_timer(void *arg)
 
 int main()
 {
-    uint32_t current = 0;
+    printf("Current time: %llu ms\n", (unsigned long long)get_monotonic_ms());
     Wheel wheel;
     initWheel(&wheel);
 
-    // 动态分配参数，避免悬空指针
     int *val1 = malloc(sizeof(int));
     *val1 = 1;
     int *val2 = malloc(sizeof(int));
@@ -291,19 +379,19 @@ int main()
     int *val3 = malloc(sizeof(int));
     *val3 = 3;
 
-    TimeWheelNode *t1 = addNewTimer(&wheel, on_timer, 1000, val1, current);
-    TimeWheelNode *t2 = addNewTimer(&wheel, on_timer, 4000, val2, current);
-    TimeWheelNode *t3 = addNewTimer(&wheel, on_timer, 5000, val3, current);
+    TimeWheelNode *t1 = addNewTimer(&wheel, on_timer, 1000, val1);
+    TimeWheelNode *t2 = addNewTimer(&wheel, on_timer, 4000, val2);
+    TimeWheelNode *t3 = addNewTimer(&wheel, on_timer, 5000, val3);
 
     cancelTimer(t2);
 
     printf("Running timer system for ~6 seconds...\n");
 
-    for (uint32_t i = 0; i < 6000; i++)
+    for (int i = 0; i < 6; ++i)
     {
-        expireTimer(&wheel, current);
-        current++;
-        usleep(1000); // ~1ms per tick
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        nanosleep(&ts, NULL); // sleep 1 second
+        expireTimer(&wheel);  // 检查是否到期
     }
 
     clearTimeWheel(&wheel);
